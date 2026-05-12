@@ -30,7 +30,15 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'troque-isso-em-producao-' + Date.now();
+// JWT_SECRET — IMPORTANTE: deve ser definido como variável de ambiente!
+// O fallback é FIXO (não usa Date.now) pra não invalidar tokens a cada redeploy.
+// Em produção, sempre configure JWT_SECRET no Railway/heroku/etc.
+const JWT_SECRET = process.env.JWT_SECRET ||
+  'FALLBACK-fixo-fodinha-private-DEFINA-JWT_SECRET-NO-AMBIENTE';
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠️ AVISO: JWT_SECRET não definido! Usando fallback inseguro.');
+  console.warn('   Configure a variável JWT_SECRET no Railway para produção.');
+}
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -781,7 +789,7 @@ app.get('/', (req, res) => {
     name: 'Fodinha Private Backend',
     status: 'running',
     health: '/health',
-    version: '3.2-case-insensitive'  // ← se aparecer isso, o backend está atualizado
+    version: '3.3-fix-token-persistence'  // ← se aparecer isso, o backend está atualizado
   });
 });
 
