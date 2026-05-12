@@ -293,8 +293,16 @@ io.on('connection', (socket) => {
 });
 
 // ============================================
-// HEALTH CHECK
+// HEALTH CHECK / ROOT
 // ============================================
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Fodinha Private Backend',
+    status: 'running',
+    health: '/health'
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -303,11 +311,20 @@ app.get('/health', (req, res) => {
   });
 });
 
-server.listen(PORT, () => {
+// Captura erros não tratados para o Railway logar (em vez de morrer silencioso)
+process.on('uncaughtException', (err) => {
+  console.error('💥 Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('💥 Unhandled Rejection:', reason);
+});
+
+// Bind em 0.0.0.0 para o Railway conseguir rotear o tráfego
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════╗
-║  ZapClone Backend rodando              ║
-║  http://localhost:${PORT}                  ║
+║  Fodinha Private Backend rodando       ║
+║  Porta: ${PORT}                              ║
 ║  Pronto pra receber conexões!          ║
 ╚════════════════════════════════════════╝
   `);
