@@ -421,34 +421,39 @@ io.on('connection', (socket) => {
 
     if (receiverId === BROADCAST_ID) {
       // Grupo "Todos": salva UMA mensagem com receiver_id = -1
-      // Quando alguém abre o grupo, busca todas mensagens com receiver_id = -1
-      const result = db.prepare(`
-        INSERT INTO messages (sender_id, receiver_id, type, content, media_url, duration_ms, delivered)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
-      `).run(
-        userId, BROADCAST_ID, type,
-        content || null, mediaUrl || null, durationMs || null
-      );
+      try {
+        const result = db.prepare(`
+          INSERT INTO messages (sender_id, receiver_id, type, content, media_url, duration_ms, delivered)
+          VALUES (?, ?, ?, ?, ?, ?, 1)
+        `).run(
+          userId, BROADCAST_ID, type,
+          content || null, mediaUrl || null, durationMs || null
+        );
 
-      const msg = {
-        id: result.lastInsertRowid,
-        sender_id: userId,
-        receiver_id: BROADCAST_ID,
-        type, content, media_url: mediaUrl,
-        duration_ms: durationMs,
-        created_at: Math.floor(Date.now() / 1000),
-        is_broadcast: true,
-        delivered: 1
-      };
+        const msg = {
+          id: result.lastInsertRowid,
+          sender_id: userId,
+          receiver_id: BROADCAST_ID,
+          type, content, media_url: mediaUrl,
+          duration_ms: durationMs,
+          created_at: Math.floor(Date.now() / 1000),
+          is_broadcast: true,
+          delivered: 1
+        };
 
-      // Entrega em tempo real pra todos os outros usuários online
-      let sent = 0;
-      for (const [uid, sid] of onlineUsers) {
-        if (uid === userId) continue;
-        io.to(sid).emit('message:new', msg);
-        sent++;
+        // Entrega em tempo real pra todos os outros usuários online
+        let sent = 0;
+        for (const [uid, sid] of onlineUsers) {
+          if (uid === userId) continue;
+          io.to(sid).emit('message:new', msg);
+          sent++;
+        }
+        console.log(`📢 [Todos] ${socket.user.username}: ${(content || msg.type).substring(0, 40)} (${sent} online)`);
+        if (ack) ack({ ok: true, broadcast: true, deliveredTo: sent });
+      } catch (err) {
+        console.error('❌ Erro ao enviar broadcast:', err.message);
+        if (ack) ack({ ok: false, error: err.message });
       }
-      if (ack) ack({ ok: true, broadcast: true, deliveredTo: sent });
       return;
     }
 
@@ -592,7 +597,8 @@ app.get('/', (req, res) => {
   res.json({
     name: 'Fodinha Private Backend',
     status: 'running',
-    health: '/health'
+    health: '/health',
+    version: '2.0-broadcast-room'  // ← se aparecer isso, o backend está atualizado
   });
 });
 
