@@ -170,6 +170,31 @@ app.post('/api/upload', authMiddleware, upload.single('file'), (req, res) => {
 });
 
 // ============================================
+// CRASH REPORTS
+// ============================================
+const CRASH_DIR = path.join(__dirname, 'crash_reports');
+if (!fs.existsSync(CRASH_DIR)) fs.mkdirSync(CRASH_DIR, { recursive: true });
+
+app.post('/api/crash', (req, res) => {
+  const { report } = req.body || {};
+  if (!report) return res.status(400).json({ error: 'Sem report' });
+  const filename = `crash_${Date.now()}.txt`;
+  fs.writeFileSync(path.join(CRASH_DIR, filename), report);
+  console.error('🐛 Crash report recebido:', filename);
+  res.json({ ok: true, saved: filename });
+});
+
+// Lista os reports para você visualizar
+app.get('/api/crash', authMiddleware, (req, res) => {
+  const files = fs.readdirSync(CRASH_DIR).sort().reverse();
+  const reports = files.slice(0, 50).map(f => ({
+    filename: f,
+    content: fs.readFileSync(path.join(CRASH_DIR, f), 'utf-8')
+  }));
+  res.json(reports);
+});
+
+// ============================================
 // SOCKET.IO - TEMPO REAL
 // ============================================
 const onlineUsers = new Map(); // userId -> socketId
@@ -197,8 +222,39 @@ io.on('connection', (socket) => {
   // ----------------------------------------
   // MENSAGEM (texto, áudio gravado, imagem, vídeo)
   // ----------------------------------------
+  // Constante: ID especial pra broadcast (grupo "Todos")
+  // Frontend envia receiverId = -1 quando quer mandar pra todos
+  const BROADCAST_ID = -1;
+
   socket.on('message:send', (data, ack) => {
     const { receiverId, type, content, mediaUrl, durationMs } = data;
+
+    if (receiverId === BROADCAST_ID) {
+      // Broadcast: salva uma mensagem por destinatário online
+      const recipients = [];
+      for (const [uid, sid] of onlineUsers) {
+        if (uid === userId) continue;
+        const result = db.prepare(`
+          INSERT INTO messages (sender_id, receiver_id, type, content, media_url, duration_ms, delivered)
+          VALUES (?, ?, ?, ?, ?, ?, 1)
+        `).run(userId, uid, type, content || null, mediaUrl || null, durationMs || null);
+        const msg = {
+          id: result.lastInsertRowid,
+          sender_id: userId,
+          receiver_id: uid,
+          type, content, media_url: mediaUrl,
+          duration_ms: durationMs,
+          created_at: Math.floor(Date.now() / 1000),
+          is_broadcast: true,
+          delivered: 1
+        };
+        io.to(sid).emit('message:new', msg);
+        recipients.push(uid);
+      }
+      if (ack) ack({ ok: true, broadcast: true, recipients });
+      return;
+    }
+
     const result = db.prepare(`
       INSERT INTO messages (sender_id, receiver_id, type, content, media_url, duration_ms)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -230,6 +286,17 @@ io.on('connection', (socket) => {
 
   // Aviso de início (alerta sonoro tipo "bip" do Nextel no destinatário)
   socket.on('ptt:start', ({ receiverId }) => {
+    if (receiverId === BROADCAST_ID) {
+      for (const [uid, sid] of onlineUsers) {
+        if (uid === userId) continue;
+        io.to(sid).emit('ptt:incoming', {
+          fromUserId: userId,
+          fromUsername: socket.user.username,
+          isBroadcast: true
+        });
+      }
+      return;
+    }
     const target = onlineUsers.get(receiverId);
     if (target) {
       io.to(target).emit('ptt:incoming', {
@@ -241,28 +308,57 @@ io.on('connection', (socket) => {
 
   // Chunks de áudio sendo transmitidos em tempo real
   socket.on('ptt:chunk', ({ receiverId, chunk, seq }) => {
+    if (receiverId === BROADCAST_ID) {
+      for (const [uid, sid] of onlineUsers) {
+        if (uid === userId) continue;
+        io.to(sid).emit('ptt:chunk', { fromUserId: userId, chunk, seq });
+      }
+      return;
+    }
     const target = onlineUsers.get(receiverId);
     if (target) {
-      io.to(target).emit('ptt:chunk', {
-        fromUserId: userId,
-        chunk,  // buffer de áudio (base64 ou binário)
-        seq
-      });
+      io.to(target).emit('ptt:chunk', { fromUserId: userId, chunk, seq });
     }
   });
 
   // Fim da transmissão PTT
   socket.on('ptt:end', ({ receiverId, totalDurationMs, fullAudioUrl }) => {
+    if (receiverId === BROADCAST_ID) {
+      for (const [uid, sid] of onlineUsers) {
+        if (uid === userId) continue;
+        io.to(sid).emit('ptt:end', { fromUserId: userId, totalDurationMs });
+      }
+      return;
+    }
     const target = onlineUsers.get(receiverId);
     if (target) {
       io.to(target).emit('ptt:end', { fromUserId: userId, totalDurationMs });
     }
-    // Salva no histórico como mensagem PTT
     if (fullAudioUrl) {
       db.prepare(`
         INSERT INTO messages (sender_id, receiver_id, type, media_url, duration_ms)
         VALUES (?, ?, 'ptt', ?, ?)
       `).run(userId, receiverId, fullAudioUrl, totalDurationMs);
+    }
+  });
+
+  // ----------------------------------------
+  // ALERTA (cutucada estilo Nextel)
+  // Toca um chirp insistente no celular do destinatário
+  // ----------------------------------------
+  socket.on('alert', ({ receiverId }) => {
+    const fromInfo = {
+      fromUserId: userId,
+      fromUsername: socket.user.username
+    };
+    if (receiverId === BROADCAST_ID) {
+      for (const [uid, sid] of onlineUsers) {
+        if (uid === userId) continue;
+        io.to(sid).emit('alert:incoming', fromInfo);
+      }
+    } else {
+      const target = onlineUsers.get(receiverId);
+      if (target) io.to(target).emit('alert:incoming', fromInfo);
     }
   });
 
