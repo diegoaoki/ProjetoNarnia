@@ -209,6 +209,42 @@ app.get('/api/messages/:contactId', authMiddleware, (req, res) => {
   res.json(messages);
 });
 
+// Retorna a última mensagem + contagem de não lidas de cada contato
+// (usado pra mostrar "última msg" e badge na lista de contatos)
+app.get('/api/conversations', authMiddleware, (req, res) => {
+  const userId = req.user.id;
+
+  // Pega todos os usuários (potenciais conversas)
+  const users = db.prepare('SELECT id, username, display_name as displayName FROM users WHERE id != ?').all(userId);
+
+  const conversations = users.map(user => {
+    // Última mensagem entre os dois
+    const lastMsg = db.prepare(`
+      SELECT * FROM messages
+      WHERE (sender_id = ? AND receiver_id = ?)
+         OR (sender_id = ? AND receiver_id = ?)
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(userId, user.id, user.id, userId);
+
+    // Conta não lidas (mensagens recebidas sem read_at)
+    const unread = db.prepare(`
+      SELECT COUNT(*) as n FROM messages
+      WHERE sender_id = ? AND receiver_id = ? AND read_at IS NULL
+    `).get(user.id, userId).n;
+
+    return {
+      contactId: user.id,
+      contactName: user.displayName,
+      contactUsername: user.username,
+      lastMessage: lastMsg,
+      unread
+    };
+  });
+
+  res.json(conversations);
+});
+
 app.post('/api/upload', authMiddleware, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Sem arquivo' });
   res.json({ url: `/uploads/${req.file.filename}` });
@@ -339,6 +375,29 @@ io.on('connection', (socket) => {
   socket.broadcast.emit('user:online', { userId });
 
   // ----------------------------------------
+  // ENVIA MENSAGENS PENDENTES (recebidas enquanto estava offline)
+  // ----------------------------------------
+  try {
+    const pending = db.prepare(`
+      SELECT * FROM messages
+      WHERE receiver_id = ? AND delivered = 0
+      ORDER BY created_at ASC
+    `).all(userId);
+
+    if (pending.length > 0) {
+      console.log(`📬 Entregando ${pending.length} mensagens pendentes para ${socket.user.username}`);
+      for (const msg of pending) {
+        socket.emit('message:new', msg);
+      }
+      // Marca todas como entregues
+      db.prepare('UPDATE messages SET delivered = 1 WHERE receiver_id = ? AND delivered = 0')
+        .run(userId);
+    }
+  } catch (e) {
+    console.error('Erro ao entregar pendentes:', e);
+  }
+
+  // ----------------------------------------
   // MENSAGEM (texto, áudio gravado, imagem, vídeo)
   // ----------------------------------------
   // Constante: ID especial pra broadcast (grupo "Todos")
@@ -349,14 +408,21 @@ io.on('connection', (socket) => {
     const { receiverId, type, content, mediaUrl, durationMs } = data;
 
     if (receiverId === BROADCAST_ID) {
-      // Broadcast: salva uma mensagem por destinatário online
+      // Broadcast: salva uma mensagem por usuário cadastrado (exceto o remetente)
+      // Quem está offline recebe quando abrir o app (carrega do histórico)
+      const allUsers = db.prepare('SELECT id FROM users WHERE id != ?').all(userId);
       const recipients = [];
-      for (const [uid, sid] of onlineUsers) {
-        if (uid === userId) continue;
+
+      for (const { id: uid } of allUsers) {
         const result = db.prepare(`
           INSERT INTO messages (sender_id, receiver_id, type, content, media_url, duration_ms, delivered)
-          VALUES (?, ?, ?, ?, ?, ?, 1)
-        `).run(userId, uid, type, content || null, mediaUrl || null, durationMs || null);
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          userId, uid, type,
+          content || null, mediaUrl || null, durationMs || null,
+          onlineUsers.has(uid) ? 1 : 0
+        );
+
         const msg = {
           id: result.lastInsertRowid,
           sender_id: userId,
@@ -365,12 +431,17 @@ io.on('connection', (socket) => {
           duration_ms: durationMs,
           created_at: Math.floor(Date.now() / 1000),
           is_broadcast: true,
-          delivered: 1
+          delivered: onlineUsers.has(uid) ? 1 : 0
         };
-        io.to(sid).emit('message:new', msg);
+
+        // Entrega na hora se estiver online
+        const sid = onlineUsers.get(uid);
+        if (sid) {
+          io.to(sid).emit('message:new', msg);
+        }
         recipients.push(uid);
       }
-      if (ack) ack({ ok: true, broadcast: true, recipients });
+      if (ack) ack({ ok: true, broadcast: true, recipients: recipients.length });
       return;
     }
 
