@@ -54,6 +54,7 @@ db.exec(`
     display_name TEXT NOT NULL,
     avatar_url TEXT,
     last_seen INTEGER,
+    is_admin INTEGER DEFAULT 0,
     created_at INTEGER DEFAULT (strftime('%s', 'now'))
   );
 
@@ -75,6 +76,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_conversation 
     ON messages(sender_id, receiver_id, created_at DESC);
 `);
+
+// Migração: adiciona is_admin se ainda não existe (pra bancos antigos)
+try {
+  db.prepare('SELECT is_admin FROM users LIMIT 1').get();
+} catch {
+  db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0');
+}
 
 // ============================================
 // UPLOAD DE ARQUIVOS (multer)
@@ -105,6 +113,17 @@ function authMiddleware(req, res, next) {
   }
 }
 
+function adminMiddleware(req, res, next) {
+  // Reaproveita authMiddleware antes
+  authMiddleware(req, res, () => {
+    const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(req.user.id);
+    if (!user || !user.is_admin) {
+      return res.status(403).json({ error: 'Apenas administradores' });
+    }
+    next();
+  });
+}
+
 // ============================================
 // ROTAS REST - AUTH
 // ============================================
@@ -115,12 +134,20 @@ app.post('/api/register', async (req, res) => {
   }
   try {
     const hash = await bcrypt.hash(password, 10);
-    const result = db.prepare(
-      'INSERT INTO users (username, password_hash, display_name) VALUES (?, ?, ?)'
-    ).run(username, hash, displayName);
 
-    const token = jwt.sign({ id: result.lastInsertRowid, username }, JWT_SECRET);
-    res.json({ token, user: { id: result.lastInsertRowid, username, displayName } });
+    // Primeiro usuário cadastrado vira admin automaticamente
+    const userCount = db.prepare('SELECT COUNT(*) as n FROM users').get().n;
+    const isAdmin = userCount === 0 ? 1 : 0;
+
+    const result = db.prepare(
+      'INSERT INTO users (username, password_hash, display_name, is_admin) VALUES (?, ?, ?, ?)'
+    ).run(username, hash, displayName, isAdmin);
+
+    const token = jwt.sign({ id: result.lastInsertRowid, username, isAdmin }, JWT_SECRET);
+    res.json({
+      token,
+      user: { id: result.lastInsertRowid, username, displayName, isAdmin: !!isAdmin }
+    });
   } catch (err) {
     if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
       return res.status(409).json({ error: 'Usuário já existe' });
@@ -135,10 +162,18 @@ app.post('/api/login', async (req, res) => {
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     return res.status(401).json({ error: 'Credenciais inválidas' });
   }
-  const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
+  const token = jwt.sign(
+    { id: user.id, username: user.username, isAdmin: user.is_admin },
+    JWT_SECRET
+  );
   res.json({
     token,
-    user: { id: user.id, username: user.username, displayName: user.display_name }
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.display_name,
+      isAdmin: !!user.is_admin
+    }
   });
 });
 
@@ -192,6 +227,80 @@ app.get('/api/crash', authMiddleware, (req, res) => {
     content: fs.readFileSync(path.join(CRASH_DIR, f), 'utf-8')
   }));
   res.json(reports);
+});
+
+// ============================================
+// ADMIN - GESTÃO DE USUÁRIOS
+// ============================================
+
+// Verifica se o usuário logado é admin
+app.get('/api/admin/me', adminMiddleware, (req, res) => {
+  res.json({ isAdmin: true });
+});
+
+// Lista todos os usuários
+app.get('/api/admin/users', adminMiddleware, (req, res) => {
+  const users = db.prepare(`
+    SELECT id, username, display_name as displayName, is_admin as isAdmin, 
+           last_seen as lastSeen, created_at as createdAt
+    FROM users
+    ORDER BY id ASC
+  `).all();
+  res.json(users);
+});
+
+// Reseta a senha de um usuário
+app.post('/api/admin/users/:id/reset-password', adminMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { newPassword } = req.body;
+  if (!newPassword || newPassword.length < 4) {
+    return res.status(400).json({ error: 'Senha precisa ter no mínimo 4 caracteres' });
+  }
+  const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(id);
+  if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+  const hash = await bcrypt.hash(newPassword, 10);
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, id);
+
+  console.log(`🔑 Admin resetou senha de ${user.username}`);
+  res.json({ ok: true, username: user.username });
+});
+
+// Promove/rebaixa admin
+app.post('/api/admin/users/:id/toggle-admin', adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  const user = db.prepare('SELECT id, is_admin FROM users WHERE id = ?').get(id);
+  if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+  // Impede que o último admin se rebaixe
+  if (user.is_admin) {
+    const adminCount = db.prepare('SELECT COUNT(*) as n FROM users WHERE is_admin = 1').get().n;
+    if (adminCount <= 1) {
+      return res.status(400).json({ error: 'Não pode rebaixar o último admin' });
+    }
+  }
+
+  const newValue = user.is_admin ? 0 : 1;
+  db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(newValue, id);
+  res.json({ ok: true, isAdmin: !!newValue });
+});
+
+// Apaga um usuário (e suas mensagens)
+app.delete('/api/admin/users/:id', adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  if (parseInt(id) === req.user.id) {
+    return res.status(400).json({ error: 'Não pode apagar a si mesmo' });
+  }
+  db.prepare('DELETE FROM messages WHERE sender_id = ? OR receiver_id = ?').run(id, id);
+  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  res.json({ ok: true });
+});
+
+// ============================================
+// PAGINA WEB ADMIN
+// ============================================
+app.get('/admin', (req, res) => {
+  res.send(ADMIN_HTML);
 });
 
 // ============================================
@@ -416,6 +525,206 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // Bind em 0.0.0.0 para o Railway conseguir rotear o tráfego
+// ============================================
+// PÁGINA WEB DE ADMIN (HTML standalone)
+// ============================================
+const ADMIN_HTML = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin · Fodinha Private</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  body { background: #0b141a; color: #e9edef; min-height: 100vh; padding: 20px; }
+  .container { max-width: 720px; margin: 0 auto; }
+  h1 { color: #25d366; margin-bottom: 20px; }
+  .card { background: #1f2c34; padding: 20px; border-radius: 12px; margin-bottom: 16px; }
+  input, button {
+    width: 100%; padding: 12px; border-radius: 6px; border: none;
+    font-size: 14px; margin-bottom: 8px;
+  }
+  input { background: #2a3942; color: #e9edef; }
+  button { background: #25d366; color: #000; cursor: pointer; font-weight: bold; }
+  button:hover { background: #1ebd5a; }
+  button.danger { background: #ef4444; color: #fff; }
+  button.secondary { background: #6b7280; color: #fff; }
+  .user-row {
+    display: flex; align-items: center; padding: 12px; gap: 12px;
+    border-bottom: 1px solid #2a3942;
+  }
+  .user-row:last-child { border-bottom: none; }
+  .user-info { flex: 1; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; background: #25d366; color: #000;
+  }
+  .actions { display: flex; gap: 6px; }
+  .actions button { width: auto; padding: 6px 12px; font-size: 12px; margin: 0; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: #25d366; color: #000; padding: 12px 24px; border-radius: 6px;
+    font-weight: bold; opacity: 0; transition: opacity 0.3s;
+  }
+  .toast.show { opacity: 1; }
+  .toast.error { background: #ef4444; color: #fff; }
+  .hidden { display: none; }
+  small { color: #8696a0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔐 Admin · Fodinha Private</h1>
+
+  <div id="loginCard" class="card">
+    <h3 style="margin-bottom: 12px;">Login de Administrador</h3>
+    <input id="loginUser" placeholder="Usuário admin" autocomplete="username">
+    <input id="loginPass" type="password" placeholder="Senha" autocomplete="current-password">
+    <button onclick="login()">Entrar</button>
+    <p id="loginErr" style="color:#ef4444;margin-top:8px;"></p>
+  </div>
+
+  <div id="panel" class="hidden">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h3>Usuários cadastrados</h3>
+        <button class="secondary" style="width:auto;padding:6px 12px;" onclick="logout()">Sair</button>
+      </div>
+      <div id="usersList" style="margin-top: 16px;"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+</div>
+
+<script>
+let token = localStorage.getItem('admin_token');
+const $ = (id) => document.getElementById(id);
+
+function toast(msg, isError = false) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isError ? ' error' : '');
+  setTimeout(() => t.className = 'toast', 3000);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: 'Bearer ' + token } : {}),
+      ...(opts.headers || {})
+    }
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Erro' }));
+    throw new Error(err.error || 'Erro ' + res.status);
+  }
+  return res.json();
+}
+
+async function login() {
+  $('loginErr').textContent = '';
+  try {
+    const resp = await api('/api/login', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: $('loginUser').value,
+        password: $('loginPass').value
+      })
+    });
+    if (!resp.user.isAdmin) {
+      $('loginErr').textContent = 'Esse usuário não é administrador.';
+      return;
+    }
+    token = resp.token;
+    localStorage.setItem('admin_token', token);
+    showPanel();
+  } catch (e) {
+    $('loginErr').textContent = e.message;
+  }
+}
+
+function logout() {
+  token = null;
+  localStorage.removeItem('admin_token');
+  $('panel').classList.add('hidden');
+  $('loginCard').classList.remove('hidden');
+}
+
+async function showPanel() {
+  try {
+    await api('/api/admin/me');
+    $('loginCard').classList.add('hidden');
+    $('panel').classList.remove('hidden');
+    await loadUsers();
+  } catch {
+    logout();
+  }
+}
+
+async function loadUsers() {
+  const users = await api('/api/admin/users');
+  const list = $('usersList');
+  list.innerHTML = users.map(u => \`
+    <div class="user-row">
+      <div class="user-info">
+        <strong>\${u.displayName}</strong>
+        \${u.isAdmin ? '<span class="badge">admin</span>' : ''}
+        <br><small>@\${u.username} · id \${u.id}</small>
+      </div>
+      <div class="actions">
+        <button onclick="resetPwd(\${u.id}, '\${u.username}')">🔑 Resetar</button>
+        <button class="secondary" onclick="toggleAdmin(\${u.id})">\${u.isAdmin ? '↓' : '↑'} Admin</button>
+        <button class="danger" onclick="deleteUser(\${u.id}, '\${u.username}')">🗑</button>
+      </div>
+    </div>
+  \`).join('');
+}
+
+async function resetPwd(id, username) {
+  const newPassword = prompt('Nova senha para ' + username + ':');
+  if (!newPassword) return;
+  if (newPassword.length < 4) return toast('Senha curta demais', true);
+  try {
+    await api('/api/admin/users/' + id + '/reset-password', {
+      method: 'POST',
+      body: JSON.stringify({ newPassword })
+    });
+    toast('Senha de ' + username + ' resetada!');
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function toggleAdmin(id) {
+  try {
+    await api('/api/admin/users/' + id + '/toggle-admin', { method: 'POST' });
+    await loadUsers();
+    toast('Permissão atualizada');
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function deleteUser(id, username) {
+  if (!confirm('Apagar ' + username + ' e todas as mensagens? Não tem volta.')) return;
+  try {
+    await api('/api/admin/users/' + id, { method: 'DELETE' });
+    await loadUsers();
+    toast('Usuário apagado');
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+// Tenta auto-login se já tem token
+if (token) showPanel();
+</script>
+</body>
+</html>`;
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════╗
