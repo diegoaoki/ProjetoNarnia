@@ -105,6 +105,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_fcm_user ON fcm_tokens(user_id);
 `);
 
+// Garante usuário "virtual" id=-1 pro grupo Todos
+// (necessário porque a FK em messages.receiver_id aponta pra users.id)
+try {
+  const existing = db.prepare('SELECT id FROM users WHERE id = -1').get();
+  if (!existing) {
+    db.prepare(`
+      INSERT INTO users (id, username, password_hash, display_name, is_admin)
+      VALUES (-1, '_broadcast_', '__none__', 'Todos', 0)
+    `).run();
+    console.log('✓ Usuário virtual do grupo Todos criado (id=-1)');
+  }
+} catch (e) {
+  console.error('Erro ao criar user virtual:', e.message);
+}
+
 // ============================================
 // FIREBASE ADMIN SDK (push notifications)
 // ============================================
@@ -272,8 +287,9 @@ app.post('/api/login', async (req, res) => {
 // ROTAS REST - CONTATOS E MENSAGENS
 // ============================================
 app.get('/api/contacts', authMiddleware, (req, res) => {
+  // Exclui o próprio usuário E o "virtual" do grupo Todos (id=-1)
   const contacts = db.prepare(
-    'SELECT id, username, display_name as displayName, avatar_url as avatarUrl, last_seen as lastSeen FROM users WHERE id != ?'
+    'SELECT id, username, display_name as displayName, avatar_url as avatarUrl, last_seen as lastSeen FROM users WHERE id != ? AND id != -1'
   ).all(req.user.id);
   res.json(contacts);
 });
@@ -308,8 +324,8 @@ app.get('/api/messages/:contactId', authMiddleware, (req, res) => {
 app.get('/api/conversations', authMiddleware, (req, res) => {
   const userId = req.user.id;
 
-  // Pega todos os usuários (potenciais conversas)
-  const users = db.prepare('SELECT id, username, display_name as displayName FROM users WHERE id != ?').all(userId);
+  // Pega todos os usuários (potenciais conversas) — exclui o user virtual do Todos
+  const users = db.prepare('SELECT id, username, display_name as displayName FROM users WHERE id != ? AND id != -1').all(userId);
 
   const conversations = users.map(user => {
     // Última mensagem entre os dois
@@ -550,7 +566,7 @@ io.on('connection', (socket) => {
         }
 
         // PUSH FCM pra todos (alcança app fechado)
-        const targetIds = db.prepare('SELECT id FROM users WHERE id != ?').all(userId).map(u => u.id);
+        const targetIds = db.prepare('SELECT id FROM users WHERE id != ? AND id != -1').all(userId).map(u => u.id);
         sendPush(targetIds, {
           type: 'message',
           senderId: userId,
@@ -680,7 +696,7 @@ io.on('connection', (socket) => {
         io.to(sid).emit('alert:incoming', fromInfo);
       }
       // Push pra todos
-      const targetIds = db.prepare('SELECT id FROM users WHERE id != ?').all(userId).map(u => u.id);
+      const targetIds = db.prepare('SELECT id FROM users WHERE id != ? AND id != -1').all(userId).map(u => u.id);
       sendPush(targetIds, {
         type: 'alert',
         senderId: userId,
@@ -734,7 +750,7 @@ app.get('/', (req, res) => {
     name: 'Fodinha Private Backend',
     status: 'running',
     health: '/health',
-    version: '3.0-fcm-push'  // ← se aparecer isso, o backend está atualizado
+    version: '3.1-fix-fk-broadcast'  // ← se aparecer isso, o backend está atualizado
   });
 });
 
