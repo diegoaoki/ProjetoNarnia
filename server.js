@@ -120,6 +120,24 @@ try {
   console.error('Erro ao criar user virtual:', e.message);
 }
 
+// Migração: padroniza usernames existentes pra lowercase
+// (necessário pra usuários cadastrados antes da regra de case-insensitive)
+try {
+  const usersToFix = db.prepare(
+    "SELECT id, username FROM users WHERE username != LOWER(username) AND id != -1"
+  ).all();
+  if (usersToFix.length > 0) {
+    const stmt = db.prepare('UPDATE users SET username = LOWER(username) WHERE id = ?');
+    for (const u of usersToFix) {
+      stmt.run(u.id);
+      console.log(`  · ${u.username} → ${u.username.toLowerCase()}`);
+    }
+    console.log(`✓ ${usersToFix.length} username(s) padronizado(s) pra lowercase`);
+  }
+} catch (e) {
+  console.error('Erro ao migrar usernames:', e.message);
+}
+
 // ============================================
 // FIREBASE ADMIN SDK (push notifications)
 // ============================================
@@ -234,15 +252,21 @@ function adminMiddleware(req, res, next) {
 // ROTAS REST - AUTH
 // ============================================
 app.post('/api/register', async (req, res) => {
-  const { username, password, displayName } = req.body;
+  const { password, displayName } = req.body;
+  let { username } = req.body;
   if (!username || !password || !displayName) {
     return res.status(400).json({ error: 'Dados incompletos' });
+  }
+  // Normaliza username: minúsculas + trim (sem espaços nas pontas)
+  username = String(username).trim().toLowerCase();
+  if (username.length < 3) {
+    return res.status(400).json({ error: 'Usuário deve ter pelo menos 3 caracteres' });
   }
   try {
     const hash = await bcrypt.hash(password, 10);
 
     // Primeiro usuário cadastrado vira admin automaticamente
-    const userCount = db.prepare('SELECT COUNT(*) as n FROM users').get().n;
+    const userCount = db.prepare('SELECT COUNT(*) as n FROM users WHERE id != -1').get().n;
     const isAdmin = userCount === 0 ? 1 : 0;
 
     const result = db.prepare(
@@ -263,8 +287,15 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  const { password } = req.body;
+  let { username } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Dados incompletos' });
+  }
+  // Normaliza username: minúsculas + trim — assim aceita "Diego", "DIEGO", "diego "
+  username = String(username).trim().toLowerCase();
+
+  const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = ?').get(username);
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     return res.status(401).json({ error: 'Credenciais inválidas' });
   }
@@ -750,7 +781,7 @@ app.get('/', (req, res) => {
     name: 'Fodinha Private Backend',
     status: 'running',
     health: '/health',
-    version: '3.1-fix-fk-broadcast'  // ← se aparecer isso, o backend está atualizado
+    version: '3.2-case-insensitive'  // ← se aparecer isso, o backend está atualizado
   });
 });
 
