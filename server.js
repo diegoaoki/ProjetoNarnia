@@ -111,7 +111,29 @@ db.exec(`
     created_at INTEGER DEFAULT (strftime('%s', 'now'))
   );
   CREATE INDEX IF NOT EXISTS idx_fcm_user ON fcm_tokens(user_id);
+
+  CREATE TABLE IF NOT EXISTS invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    created_by INTEGER NOT NULL,
+    used_by INTEGER,
+    used_at INTEGER,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_invites_code ON invites(code);
 `);
+
+// Limpa convites expirados ao subir (housekeeping)
+try {
+  const now = Math.floor(Date.now() / 1000);
+  const result = db.prepare('DELETE FROM invites WHERE expires_at < ? AND used_by IS NULL').run(now);
+  if (result.changes > 0) {
+    console.log(`🧹 ${result.changes} convite(s) expirado(s) removido(s)`);
+  }
+} catch (e) {
+  console.error('Erro ao limpar convites:', e.message);
+}
 
 // Garante usuário "virtual" id=-1 pro grupo Todos
 // (necessário porque a FK em messages.receiver_id aponta pra users.id)
@@ -260,7 +282,7 @@ function adminMiddleware(req, res, next) {
 // ROTAS REST - AUTH
 // ============================================
 app.post('/api/register', async (req, res) => {
-  const { password, displayName } = req.body;
+  const { password, displayName, inviteCode } = req.body;
   let { username } = req.body;
   if (!username || !password || !displayName) {
     return res.status(400).json({ error: 'Dados incompletos' });
@@ -270,16 +292,44 @@ app.post('/api/register', async (req, res) => {
   if (username.length < 3) {
     return res.status(400).json({ error: 'Usuário deve ter pelo menos 3 caracteres' });
   }
+
+  // Conta quantos usuários reais existem (ignora o user virtual -1)
+  const userCount = db.prepare('SELECT COUNT(*) as n FROM users WHERE id != -1').get().n;
+  const isFirstUser = userCount === 0;
+
+  // Valida convite (exceto pro primeiro usuário, que vira admin automaticamente)
+  let inviteRow = null;
+  if (!isFirstUser) {
+    if (!inviteCode) {
+      return res.status(400).json({ error: 'Código de convite obrigatório' });
+    }
+    const code = String(inviteCode).trim().toUpperCase();
+    inviteRow = db.prepare('SELECT * FROM invites WHERE code = ?').get(code);
+    if (!inviteRow) {
+      return res.status(400).json({ error: 'Código de convite inválido' });
+    }
+    if (inviteRow.used_by) {
+      return res.status(400).json({ error: 'Código de convite já foi utilizado' });
+    }
+    if (inviteRow.expires_at < Math.floor(Date.now() / 1000)) {
+      return res.status(400).json({ error: 'Código de convite expirado' });
+    }
+  }
+
   try {
     const hash = await bcrypt.hash(password, 10);
-
-    // Primeiro usuário cadastrado vira admin automaticamente
-    const userCount = db.prepare('SELECT COUNT(*) as n FROM users WHERE id != -1').get().n;
-    const isAdmin = userCount === 0 ? 1 : 0;
+    const isAdmin = isFirstUser ? 1 : 0;
 
     const result = db.prepare(
       'INSERT INTO users (username, password_hash, display_name, is_admin) VALUES (?, ?, ?, ?)'
     ).run(username, hash, displayName, isAdmin);
+
+    // Marca o convite como usado
+    if (inviteRow) {
+      db.prepare(
+        'UPDATE invites SET used_by = ?, used_at = ? WHERE id = ?'
+      ).run(result.lastInsertRowid, Math.floor(Date.now() / 1000), inviteRow.id);
+    }
 
     const token = jwt.sign({ id: result.lastInsertRowid, username, isAdmin }, JWT_SECRET);
     res.json({
@@ -416,6 +466,75 @@ app.post('/api/fcm-token', authMiddleware, (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ============================================
+// CONVITES (qualquer usuário pode gerar pros amigos)
+// ============================================
+function generateInviteCode() {
+  // Gera código tipo "TR4C9X" — 6 chars maiúsculos, sem confusos (0,O,1,I)
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+/** Gera um novo código de convite (válido por 7 dias, uso único). */
+app.post('/api/invites', authMiddleware, (req, res) => {
+  try {
+    // Tenta até 5 vezes caso o código gerado já exista
+    let code;
+    let attempts = 0;
+    while (attempts < 5) {
+      code = generateInviteCode();
+      const exists = db.prepare('SELECT 1 FROM invites WHERE code = ?').get(code);
+      if (!exists) break;
+      attempts++;
+    }
+
+    const expiresAt = Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60); // 7 dias
+    db.prepare(
+      'INSERT INTO invites (code, created_by, expires_at) VALUES (?, ?, ?)'
+    ).run(code, req.user.id, expiresAt);
+
+    res.json({ code, expiresAt });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** Lista convites criados pelo usuário (e mostra se foram usados). */
+app.get('/api/invites', authMiddleware, (req, res) => {
+  const userId = req.user.id;
+  const rows = db.prepare(`
+    SELECT i.id, i.code, i.created_at, i.expires_at, i.used_at,
+           u.username AS used_by_username, u.display_name AS used_by_displayName
+    FROM invites i
+    LEFT JOIN users u ON u.id = i.used_by
+    WHERE i.created_by = ?
+    ORDER BY i.created_at DESC
+    LIMIT 50
+  `).all(userId);
+  res.json(rows);
+});
+
+/** Apaga um convite que ainda não foi usado. */
+app.delete('/api/invites/:code', authMiddleware, (req, res) => {
+  const code = String(req.params.code).trim().toUpperCase();
+  const invite = db.prepare(
+    'SELECT * FROM invites WHERE code = ? AND created_by = ?'
+  ).get(code, req.user.id);
+
+  if (!invite) {
+    return res.status(404).json({ error: 'Convite não encontrado' });
+  }
+  if (invite.used_by) {
+    return res.status(400).json({ error: 'Convite já foi usado, não pode ser apagado' });
+  }
+  db.prepare('DELETE FROM invites WHERE id = ?').run(invite.id);
+  res.json({ ok: true });
 });
 
 // ============================================
@@ -789,7 +908,7 @@ app.get('/', (req, res) => {
     name: 'Fodinha Private Backend',
     status: 'running',
     health: '/health',
-    version: '3.3-fix-token-persistence'  // ← se aparecer isso, o backend está atualizado
+    version: '3.4-invite-codes'  // ← se aparecer isso, o backend está atualizado
   });
 });
 
