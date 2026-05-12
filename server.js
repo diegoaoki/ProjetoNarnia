@@ -35,15 +35,25 @@ const JWT_SECRET = process.env.JWT_SECRET || 'troque-isso-em-producao-' + Date.n
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ============================================
+// DIRETÓRIO DE DADOS PERSISTENTES
+// ============================================
+// No Railway, montamos um Volume em /data → tudo que vai pra lá sobrevive
+// a deploys e restarts. Localmente, usamos a pasta do projeto.
+const DATA_DIR = fs.existsSync('/data') ? '/data' : __dirname;
+console.log(`📁 Usando diretório de dados: ${DATA_DIR}`);
+
 // Pasta para uploads (fotos, vídeos, áudios)
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOAD_DIR));
 
 // ============================================
-// BANCO DE DADOS (SQLite)
+// BANCO DE DADOS (SQLite no volume persistente)
 // ============================================
-const db = new Database(path.join(__dirname, 'zapclone.db'));
+const DB_PATH = path.join(DATA_DIR, 'zapclone.db');
+console.log(`💾 Banco em: ${DB_PATH}`);
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -207,7 +217,7 @@ app.post('/api/upload', authMiddleware, upload.single('file'), (req, res) => {
 // ============================================
 // CRASH REPORTS
 // ============================================
-const CRASH_DIR = path.join(__dirname, 'crash_reports');
+const CRASH_DIR = path.join(DATA_DIR, 'crash_reports');
 if (!fs.existsSync(CRASH_DIR)) fs.mkdirSync(CRASH_DIR, { recursive: true });
 
 app.post('/api/crash', (req, res) => {
