@@ -198,10 +198,23 @@ app.get('/api/contacts', authMiddleware, (req, res) => {
 });
 
 app.get('/api/messages/:contactId', authMiddleware, (req, res) => {
-  const { contactId } = req.params;
+  const contactId = parseInt(req.params.contactId);
+
+  // Grupo "Todos": busca todas as mensagens com receiver_id = -1
+  if (contactId === -1) {
+    const messages = db.prepare(`
+      SELECT * FROM messages
+      WHERE receiver_id = -1
+      ORDER BY created_at ASC
+      LIMIT 200
+    `).all();
+    return res.json(messages);
+  }
+
+  // Conversa privada normal
   const messages = db.prepare(`
-    SELECT * FROM messages 
-    WHERE (sender_id = ? AND receiver_id = ?) 
+    SELECT * FROM messages
+    WHERE (sender_id = ? AND receiver_id = ?)
        OR (sender_id = ? AND receiver_id = ?)
     ORDER BY created_at ASC
     LIMIT 200
@@ -389,7 +402,6 @@ io.on('connection', (socket) => {
       for (const msg of pending) {
         socket.emit('message:new', msg);
       }
-      // Marca todas como entregues
       db.prepare('UPDATE messages SET delivered = 1 WHERE receiver_id = ? AND delivered = 0')
         .run(userId);
     }
@@ -408,40 +420,35 @@ io.on('connection', (socket) => {
     const { receiverId, type, content, mediaUrl, durationMs } = data;
 
     if (receiverId === BROADCAST_ID) {
-      // Broadcast: salva uma mensagem por usuário cadastrado (exceto o remetente)
-      // Quem está offline recebe quando abrir o app (carrega do histórico)
-      const allUsers = db.prepare('SELECT id FROM users WHERE id != ?').all(userId);
-      const recipients = [];
+      // Grupo "Todos": salva UMA mensagem com receiver_id = -1
+      // Quando alguém abre o grupo, busca todas mensagens com receiver_id = -1
+      const result = db.prepare(`
+        INSERT INTO messages (sender_id, receiver_id, type, content, media_url, duration_ms, delivered)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+      `).run(
+        userId, BROADCAST_ID, type,
+        content || null, mediaUrl || null, durationMs || null
+      );
 
-      for (const { id: uid } of allUsers) {
-        const result = db.prepare(`
-          INSERT INTO messages (sender_id, receiver_id, type, content, media_url, duration_ms, delivered)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          userId, uid, type,
-          content || null, mediaUrl || null, durationMs || null,
-          onlineUsers.has(uid) ? 1 : 0
-        );
+      const msg = {
+        id: result.lastInsertRowid,
+        sender_id: userId,
+        receiver_id: BROADCAST_ID,
+        type, content, media_url: mediaUrl,
+        duration_ms: durationMs,
+        created_at: Math.floor(Date.now() / 1000),
+        is_broadcast: true,
+        delivered: 1
+      };
 
-        const msg = {
-          id: result.lastInsertRowid,
-          sender_id: userId,
-          receiver_id: uid,
-          type, content, media_url: mediaUrl,
-          duration_ms: durationMs,
-          created_at: Math.floor(Date.now() / 1000),
-          is_broadcast: true,
-          delivered: onlineUsers.has(uid) ? 1 : 0
-        };
-
-        // Entrega na hora se estiver online
-        const sid = onlineUsers.get(uid);
-        if (sid) {
-          io.to(sid).emit('message:new', msg);
-        }
-        recipients.push(uid);
+      // Entrega em tempo real pra todos os outros usuários online
+      let sent = 0;
+      for (const [uid, sid] of onlineUsers) {
+        if (uid === userId) continue;
+        io.to(sid).emit('message:new', msg);
+        sent++;
       }
-      if (ack) ack({ ok: true, broadcast: true, recipients: recipients.length });
+      if (ack) ack({ ok: true, broadcast: true, deliveredTo: sent });
       return;
     }
 
