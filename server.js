@@ -94,6 +94,87 @@ try {
   db.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0');
 }
 
+// Tabela de tokens FCM (Firebase Cloud Messaging) — push notifications
+db.exec(`
+  CREATE TABLE IF NOT EXISTS fcm_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_fcm_user ON fcm_tokens(user_id);
+`);
+
+// ============================================
+// FIREBASE ADMIN SDK (push notifications)
+// ============================================
+let firebaseAdmin = null;
+try {
+  const admin = require('firebase-admin');
+  let credential = null;
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    credential = admin.credential.cert(serviceAccount);
+  } else if (fs.existsSync(path.join(__dirname, 'firebase-service-account.json'))) {
+    const serviceAccount = require(path.join(__dirname, 'firebase-service-account.json'));
+    credential = admin.credential.cert(serviceAccount);
+  }
+
+  if (credential) {
+    admin.initializeApp({ credential });
+    firebaseAdmin = admin;
+    console.log('🔥 Firebase Admin inicializado — push notifications habilitadas');
+  } else {
+    console.log('⚠️ Sem credencial Firebase — push notifications desabilitadas');
+    console.log('   Configure FIREBASE_SERVICE_ACCOUNT no Railway pra ativar');
+  }
+} catch (e) {
+  console.error('❌ Erro ao inicializar Firebase:', e.message);
+}
+
+/**
+ * Envia push notification via FCM.
+ * Se Firebase não estiver configurado, ignora silenciosamente.
+ */
+async function sendPush(userIds, payload) {
+  if (!firebaseAdmin) return;
+  if (!Array.isArray(userIds)) userIds = [userIds];
+  if (userIds.length === 0) return;
+
+  const placeholders = userIds.map(() => '?').join(',');
+  const tokens = db.prepare(
+    `SELECT user_id, token FROM fcm_tokens WHERE user_id IN (${placeholders})`
+  ).all(...userIds);
+
+  if (tokens.length === 0) return;
+
+  const message = {
+    data: Object.fromEntries(
+      Object.entries(payload).map(([k, v]) => [k, String(v ?? '')])
+    ),
+    android: { priority: 'high' }
+  };
+
+  const results = await Promise.allSettled(
+    tokens.map(t =>
+      firebaseAdmin.messaging().send({ ...message, token: t.token })
+    )
+  );
+
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      const code = r.reason?.code || '';
+      if (code.includes('not-registered') || code.includes('invalid-argument')) {
+        console.log(`🗑️ Removendo token inválido de userId=${tokens[i].user_id}`);
+        db.prepare('DELETE FROM fcm_tokens WHERE token = ?').run(tokens[i].token);
+      }
+    }
+  });
+
+  const ok = results.filter(r => r.status === 'fulfilled').length;
+  console.log(`📲 Push: ${ok}/${tokens.length} entregues`);
+}
+
 // ============================================
 // UPLOAD DE ARQUIVOS (multer)
 // ============================================
@@ -261,6 +342,25 @@ app.get('/api/conversations', authMiddleware, (req, res) => {
 app.post('/api/upload', authMiddleware, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Sem arquivo' });
   res.json({ url: `/uploads/${req.file.filename}` });
+});
+
+// ============================================
+// FCM TOKEN — registra dispositivo pra push notifications
+// ============================================
+app.post('/api/fcm-token', authMiddleware, (req, res) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token obrigatório' });
+
+  try {
+    // Apaga registros antigos desse token (caso outro user tenha usado)
+    db.prepare('DELETE FROM fcm_tokens WHERE token = ?').run(token);
+    // Insere o novo
+    db.prepare('INSERT INTO fcm_tokens (user_id, token) VALUES (?, ?)')
+      .run(req.user.id, token);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ============================================
@@ -448,6 +548,17 @@ io.on('connection', (socket) => {
           io.to(sid).emit('message:new', msg);
           sent++;
         }
+
+        // PUSH FCM pra todos (alcança app fechado)
+        const targetIds = db.prepare('SELECT id FROM users WHERE id != ?').all(userId).map(u => u.id);
+        sendPush(targetIds, {
+          type: 'message',
+          senderId: userId,
+          senderName: socket.user.username,
+          receiverId: BROADCAST_ID,
+          content: (content || '[mídia]').substring(0, 100)
+        }).catch(e => console.error('Erro push broadcast:', e));
+
         console.log(`📢 [Todos] ${socket.user.username}: ${(content || msg.type).substring(0, 40)} (${sent} online)`);
         if (ack) ack({ ok: true, broadcast: true, deliveredTo: sent });
       } catch (err) {
@@ -478,6 +589,16 @@ io.on('connection', (socket) => {
       db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(message.id);
       message.delivered = 1;
     }
+
+    // PUSH FCM pro destinatário (alcança app fechado também)
+    sendPush([receiverId], {
+      type: 'message',
+      senderId: userId,
+      senderName: socket.user.username,
+      receiverId,
+      content: (content || '[mídia]').substring(0, 100)
+    }).catch(e => console.error('Erro push msg privada:', e));
+
     if (ack) ack({ ok: true, message });
   });
 
@@ -558,9 +679,24 @@ io.on('connection', (socket) => {
         if (uid === userId) continue;
         io.to(sid).emit('alert:incoming', fromInfo);
       }
+      // Push pra todos
+      const targetIds = db.prepare('SELECT id FROM users WHERE id != ?').all(userId).map(u => u.id);
+      sendPush(targetIds, {
+        type: 'alert',
+        senderId: userId,
+        senderName: socket.user.username,
+        receiverId: BROADCAST_ID
+      }).catch(e => console.error('Erro push alert broadcast:', e));
     } else {
       const target = onlineUsers.get(receiverId);
       if (target) io.to(target).emit('alert:incoming', fromInfo);
+      // Push pro destinatário
+      sendPush([receiverId], {
+        type: 'alert',
+        senderId: userId,
+        senderName: socket.user.username,
+        receiverId
+      }).catch(e => console.error('Erro push alert:', e));
     }
   });
 
@@ -598,7 +734,7 @@ app.get('/', (req, res) => {
     name: 'Fodinha Private Backend',
     status: 'running',
     health: '/health',
-    version: '2.0-broadcast-room'  // ← se aparecer isso, o backend está atualizado
+    version: '3.0-fcm-push'  // ← se aparecer isso, o backend está atualizado
   });
 });
 
