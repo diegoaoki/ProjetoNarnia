@@ -641,6 +641,24 @@ app.get('/admin', (req, res) => {
 // ============================================
 const onlineUsers = new Map(); // userId -> socketId
 
+// Rastreia quem está transmitindo PTT em cada canal AGORA.
+//   - Chave: receiverId (-1 = broadcast Todos, ou userId pra privado)
+//   - Valor: { userId, username, startedAt }
+// Usado pra rejeitar novos PTTs enquanto alguém está falando (canal ocupado).
+const activePttChannels = new Map();
+
+// Timeout de segurança: se algum ptt:end nunca chegar (cliente travou),
+// libera o canal automaticamente após 60s
+function autoReleaseStuckChannel(channelId, expectedUserId) {
+  setTimeout(() => {
+    const current = activePttChannels.get(channelId);
+    if (current && current.userId === expectedUserId) {
+      console.log(`⏱️ Liberação automática de canal PTT (timeout): ${channelId}`);
+      activePttChannels.delete(channelId);
+    }
+  }, 60_000);
+}
+
 // Autenticação no socket
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
@@ -655,6 +673,18 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   const userId = socket.user.id;
+
+  // Se o mesmo usuário já tinha outro socket conectado, desconecta o antigo
+  // (evita ter 2 sockets ativos do mesmo user, que cria duplicação de mensagens)
+  const previousSocketId = onlineUsers.get(userId);
+  if (previousSocketId && previousSocketId !== socket.id) {
+    const previousSocket = io.sockets.sockets.get(previousSocketId);
+    if (previousSocket) {
+      console.log(`⚠️ ${socket.user.username} reconectou — desconectando socket antigo`);
+      previousSocket.disconnect(true);
+    }
+  }
+
   onlineUsers.set(userId, socket.id);
   console.log(`✓ ${socket.user.username} conectou`);
 
@@ -782,7 +812,33 @@ io.on('connection', (socket) => {
   // ----------------------------------------
 
   // Aviso de início (alerta sonoro tipo "bip" do Nextel no destinatário)
-  socket.on('ptt:start', ({ receiverId }) => {
+  // Envia ack pro emissor saber se o canal aceita ou está ocupado
+  socket.on('ptt:start', ({ receiverId }, ack) => {
+    const channelId = receiverId;
+    const existing = activePttChannels.get(channelId);
+
+    // Canal ocupado por outra pessoa → rejeita
+    if (existing && existing.userId !== userId) {
+      console.log(`🚫 PTT rejeitado: ${socket.user.username} tentou falar em canal ocupado por ${existing.username}`);
+      if (ack) ack({ ok: false, busy: true, occupiedBy: existing.username });
+      // Também avisa o cliente via evento (caso ele não use ack)
+      socket.emit('ptt:busy', {
+        channelId,
+        occupiedBy: existing.username,
+        occupiedByUserId: existing.userId
+      });
+      return;
+    }
+
+    // Marca o canal como ocupado por esse usuário
+    activePttChannels.set(channelId, {
+      userId,
+      username: socket.user.username,
+      startedAt: Date.now()
+    });
+    autoReleaseStuckChannel(channelId, userId);
+
+    // Envia o aviso pros destinatários
     if (receiverId === BROADCAST_ID) {
       for (const [uid, sid] of onlineUsers) {
         if (uid === userId) continue;
@@ -792,19 +848,25 @@ io.on('connection', (socket) => {
           isBroadcast: true
         });
       }
-      return;
+    } else {
+      const target = onlineUsers.get(receiverId);
+      if (target) {
+        io.to(target).emit('ptt:incoming', {
+          fromUserId: userId,
+          fromUsername: socket.user.username
+        });
+      }
     }
-    const target = onlineUsers.get(receiverId);
-    if (target) {
-      io.to(target).emit('ptt:incoming', {
-        fromUserId: userId,
-        fromUsername: socket.user.username
-      });
-    }
+    if (ack) ack({ ok: true });
   });
 
   // Chunks de áudio sendo transmitidos em tempo real
   socket.on('ptt:chunk', ({ receiverId, chunk, seq }) => {
+    // Só aceita chunks de quem está com o canal "aberto"
+    // (evita áudio de quem foi rejeitado interferir)
+    const current = activePttChannels.get(receiverId);
+    if (!current || current.userId !== userId) return;
+
     if (receiverId === BROADCAST_ID) {
       for (const [uid, sid] of onlineUsers) {
         if (uid === userId) continue;
@@ -820,6 +882,15 @@ io.on('connection', (socket) => {
 
   // Fim da transmissão PTT
   socket.on('ptt:end', ({ receiverId, totalDurationMs, fullAudioUrl }) => {
+    // Só o "dono" do canal pode encerrá-lo
+    const current = activePttChannels.get(receiverId);
+    if (!current || current.userId !== userId) {
+      // Não é o dono — ignora silenciosamente
+      return;
+    }
+    // Libera o canal
+    activePttChannels.delete(receiverId);
+
     if (receiverId === BROADCAST_ID) {
       for (const [uid, sid] of onlineUsers) {
         if (uid === userId) continue;
@@ -892,11 +963,35 @@ io.on('connection', (socket) => {
   // DESCONEXÃO
   // ----------------------------------------
   socket.on('disconnect', () => {
-    onlineUsers.delete(userId);
+    // Libera qualquer canal PTT que esse usuário estava transmitindo
+    for (const [channelId, info] of activePttChannels) {
+      if (info.userId === userId) {
+        console.log(`🔓 Liberando canal PTT ${channelId} (usuário desconectou)`);
+        activePttChannels.delete(channelId);
+        // Avisa os ouvintes que o PTT acabou (pra eles pararem de aguardar)
+        if (channelId === BROADCAST_ID) {
+          for (const [uid, sid] of onlineUsers) {
+            if (uid === userId) continue;
+            io.to(sid).emit('ptt:end', { fromUserId: userId, totalDurationMs: 0 });
+          }
+        } else {
+          const target = onlineUsers.get(channelId);
+          if (target) io.to(target).emit('ptt:end', { fromUserId: userId, totalDurationMs: 0 });
+        }
+      }
+    }
+
+    // IMPORTANTE: só remove do mapa se o socket sendo desconectado for o mesmo
+    // que está registrado.
+    if (onlineUsers.get(userId) === socket.id) {
+      onlineUsers.delete(userId);
+      socket.broadcast.emit('user:offline', { userId });
+      console.log(`✗ ${socket.user.username} desconectou`);
+    } else {
+      console.log(`✗ ${socket.user.username} desconectou (socket antigo, ignorado)`);
+    }
     db.prepare('UPDATE users SET last_seen = ? WHERE id = ?')
       .run(Math.floor(Date.now() / 1000), userId);
-    socket.broadcast.emit('user:offline', { userId });
-    console.log(`✗ ${socket.user.username} desconectou`);
   });
 });
 
@@ -908,7 +1003,7 @@ app.get('/', (req, res) => {
     name: 'Fodinha Private Backend',
     status: 'running',
     health: '/health',
-    version: '3.4-invite-codes'  // ← se aparecer isso, o backend está atualizado
+    version: '3.6-ptt-channel-lock'  // ← se aparecer isso, o backend está atualizado
   });
 });
 
